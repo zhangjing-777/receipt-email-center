@@ -22,6 +22,11 @@ class Settings(BaseSettings):
     google_redirect_uri: str
 
     receiptdrop_inbox: str
+
+    aws_smtp_user: str
+    aws_smtp_pass: str
+    smtp_host: str
+    smtp_port: str
   
     # 其他配置
     encryption_key: str

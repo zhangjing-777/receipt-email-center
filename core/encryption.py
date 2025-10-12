@@ -14,7 +14,7 @@ fernet = Fernet(ENCRYPTION_KEY.encode() if isinstance(ENCRYPTION_KEY, str) else 
 # 需要加密的敏感字段
 SENSITIVE_FIELDS = {
     'gmail_confirm_link_en': ['email', 'confirm_link', 'cancel_link'],
-    'subscription_records': ['seller_name', 'plan_name', 'note']
+    'user_email_tokens': ['email', 'access_token', 'refresh_token', 'client_secret', 'token_uri']
 }
 
 def encrypt_value(value):

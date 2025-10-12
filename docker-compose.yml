@@ -1,0 +1,17 @@
+version: "3.8"
+
+services:
+  receipt-gmail-center:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: receipt-gmail-center
+    ports:
+      - "8013:8000"
+    volumes:
+      - .:/app  # 可选：挂载代码目录以便热更新或调试
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped

@@ -1,87 +1,191 @@
-import os
 import logging
-from dotenv import load_dotenv
-from supabase import create_client, Client
+import hashlib
 from fastapi import APIRouter, HTTPException
+from sqlalchemy import select, insert
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
+from core.database import AsyncSessionLocal
+from core.models import UserEmailToken
 from core.encryption import encrypt_value
+from core.config import settings
 
-
-load_dotenv()
-
-url: str = os.getenv("SUPABASE_URL")
-key: str = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-supabase: Client = create_client(url, key)
-
-CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
-CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
-REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/gmail-auth", tags=["gmail授权相关操作"])
 
+
+def generate_email_hash(email: str) -> str:
+    """生成邮箱的 SHA256 哈希值（用于去重）"""
+    return hashlib.sha256(email.lower().encode('utf-8')).hexdigest()
+
+
 @router.get("/get-auth-url")
 async def gmail_login():
     """生成 Gmail 授权链接"""
-    flow = Flow.from_client_config(
-        {
-            "web": {
-                "client_id": CLIENT_ID,
-                "client_secret": CLIENT_SECRET,
-                "redirect_uris": [REDIRECT_URI],
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token",
-            }
-        },
-        scopes=["https://www.googleapis.com/auth/gmail.readonly"],
-    )
-    flow.redirect_uri = REDIRECT_URI
-    auth_url, _ = flow.authorization_url(access_type="offline", include_granted_scopes="true")
-    logger.info(f"Gmail OAuth URL generated")
-    return {"auth_url": auth_url}
-
-@router.get("/callback")
-async def gmail_callback(user_id: str, code: str):
-    """授权成功后保存 Token（加密存储）"""
     try:
         flow = Flow.from_client_config(
             {
                 "web": {
-                    "client_id": CLIENT_ID,
-                    "client_secret": CLIENT_SECRET,
-                    "redirect_uris": [REDIRECT_URI],
+                    "client_id": settings.google_client_id,
+                    "client_secret": settings.google_client_secret,
+                    "redirect_uris": [settings.google_redirect_uri],
                     "auth_uri": "https://accounts.google.com/o/oauth2/auth",
                     "token_uri": "https://oauth2.googleapis.com/token",
                 }
             },
             scopes=["https://www.googleapis.com/auth/gmail.readonly"],
         )
-        flow.redirect_uri = REDIRECT_URI
+        flow.redirect_uri = settings.google_redirect_uri
+        auth_url, _ = flow.authorization_url(
+            access_type="offline",
+            include_granted_scopes="true",
+            prompt="consent"  # 强制显示授权页面，确保获得 refresh_token
+        )
+        logger.info("Gmail OAuth URL generated successfully")
+        return {"auth_url": auth_url}
+    except Exception as e:
+        logger.exception("Failed to generate Gmail OAuth URL")
+        raise HTTPException(status_code=500, detail=f"Failed to generate auth URL: {str(e)}")
+
+
+@router.get("/callback")
+async def gmail_callback(user_id: str, code: str):
+    """授权成功后保存 Token（加密存储到数据库）"""
+    logger.info(f"Gmail OAuth callback received for user_id={user_id}")
+    
+    try:
+        # 1. 获取 OAuth token
+        flow = Flow.from_client_config(
+            {
+                "web": {
+                    "client_id": settings.google_client_id,
+                    "client_secret": settings.google_client_secret,
+                    "redirect_uris": [settings.google_redirect_uri],
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                }
+            },
+            scopes=["https://www.googleapis.com/auth/gmail.readonly"],
+        )
+        flow.redirect_uri = settings.google_redirect_uri
         flow.fetch_token(code=code)
         creds = flow.credentials
 
+        # 2. 获取用户邮箱地址
         gmail_service = build("gmail", "v1", credentials=creds)
         profile = gmail_service.users().getProfile(userId="me").execute()
         email = profile["emailAddress"]
+        
+        logger.info(f"Successfully retrieved Gmail profile for {email}")
 
-        data = {
+        # 3. 准备加密数据
+        email_hash = generate_email_hash(email)
+        
+        token_data = {
             "user_id": user_id,
             "email_provider": "gmail",
-            "user_email": encrypt_value(email),
+            "email": encrypt_value(email),
+            "email_hash": email_hash,
             "access_token": encrypt_value(creds.token),
-            "refresh_token": encrypt_value(creds.refresh_token),
-            "token_uri": encrypt_value(creds.token_uri),
-            "client_id": CLIENT_ID,
-            "client_secret": encrypt_value(CLIENT_SECRET),
-            "expiry": creds.expiry.isoformat()
+            "refresh_token": encrypt_value(creds.refresh_token) if creds.refresh_token else None,
+            "token_uri": encrypt_value(creds.token_uri) if creds.token_uri else None,
+            "client_id": settings.google_client_id,
+            "client_secret": encrypt_value(settings.google_client_secret),
+            "expiry": creds.expiry.isoformat() if creds.expiry else None
         }
 
-        supabase.table("user_email_tokens").upsert(data).execute()
-        logger.info(f"Gmail account linked for {email}")
-
-        return {"message": "Gmail linked successfully", "email": email}
+        # 4. Upsert 到数据库（使用 PostgreSQL 的 ON CONFLICT）
+        async with AsyncSessionLocal() as session:
+            stmt = pg_insert(UserEmailToken).values(token_data)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=['user_id', 'email_provider', 'email_hash'],
+                set_={
+                    'access_token': stmt.excluded.access_token,
+                    'refresh_token': stmt.excluded.refresh_token,
+                    'token_uri': stmt.excluded.token_uri,
+                    'expiry': stmt.excluded.expiry,
+                    'updated_at': stmt.excluded.updated_at
+                }
+            )
+            await session.execute(stmt)
+            await session.commit()
+        
+        logger.info(f"Gmail account linked successfully for user {user_id}, email={email}")
+        
+        return {
+            "message": "Gmail linked successfully",
+            "email": email,
+            "status": "success"
+        }
+        
     except Exception as e:
-        logger.exception("Gmail OAuth callback failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception(f"Gmail OAuth callback failed for user_id={user_id}")
+        raise HTTPException(status_code=500, detail=f"OAuth callback failed: {str(e)}")
+
+
+@router.get("/check-token")
+async def check_gmail_token(user_id: str):
+    """检查用户是否已授权 Gmail"""
+    logger.info(f"Checking Gmail token for user_id={user_id}")
+    
+    try:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(UserEmailToken)
+                .where(UserEmailToken.user_id == user_id)
+                .where(UserEmailToken.email_provider == 'gmail')
+            )
+            token = result.scalar_one_or_none()
+        
+        if not token:
+            return {
+                "authorized": False,
+                "message": "No Gmail token found"
+            }
+        
+        return {
+            "authorized": True,
+            "email_hash": token.email_hash,
+            "created_at": token.created_at.isoformat() if token.created_at else None,
+            "updated_at": token.updated_at.isoformat() if token.updated_at else None
+        }
+        
+    except Exception as e:
+        logger.exception(f"Failed to check Gmail token for user_id={user_id}")
+        raise HTTPException(status_code=500, detail=f"Token check failed: {str(e)}")
+
+
+@router.delete("/revoke")
+async def revoke_gmail_token(user_id: str):
+    """撤销用户的 Gmail 授权"""
+    logger.info(f"Revoking Gmail token for user_id={user_id}")
+    
+    try:
+        async with AsyncSessionLocal() as session:
+            # 删除 token 记录
+            result = await session.execute(
+                select(UserEmailToken)
+                .where(UserEmailToken.user_id == user_id)
+                .where(UserEmailToken.email_provider == 'gmail')
+            )
+            token = result.scalar_one_or_none()
+            
+            if not token:
+                raise HTTPException(status_code=404, detail="Gmail token not found")
+            
+            await session.delete(token)
+            await session.commit()
+        
+        logger.info(f"Gmail token revoked successfully for user_id={user_id}")
+        return {
+            "message": "Gmail authorization revoked successfully",
+            "status": "success"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Failed to revoke Gmail token for user_id={user_id}")
+        raise HTTPException(status_code=500, detail=f"Token revocation failed: {str(e)}")
