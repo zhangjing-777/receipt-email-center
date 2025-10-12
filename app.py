@@ -24,8 +24,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Email Processing API",             
-    description="Centralized API service for processing, analyzing, and managing email data.", 
+app = FastAPI(title="Gmail Processing API",             
+    description="Centralized API service for processing, analyzing, and managing gmail data.", 
     version="1.0.0")
 
 # 添加CORS中间件
