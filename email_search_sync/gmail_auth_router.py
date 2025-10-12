@@ -35,7 +35,12 @@ async def gmail_login():
                     "token_uri": "https://oauth2.googleapis.com/token",
                 }
             },
-            scopes=["https://www.googleapis.com/auth/gmail.readonly"],
+            scopes=[
+                "https://www.googleapis.com/auth/gmail.readonly",
+                "https://www.googleapis.com/auth/userinfo.email",
+                "https://www.googleapis.com/auth/userinfo.profile",
+                "openid",
+            ]
         )
         flow.redirect_uri = settings.google_redirect_uri
         auth_url, _ = flow.authorization_url(
@@ -67,7 +72,12 @@ async def gmail_callback(user_id: str, code: str):
                     "token_uri": "https://oauth2.googleapis.com/token",
                 }
             },
-            scopes=["https://www.googleapis.com/auth/gmail.readonly"],
+            scopes=[
+                "https://www.googleapis.com/auth/gmail.readonly",
+                "https://www.googleapis.com/auth/userinfo.email",
+                "https://www.googleapis.com/auth/userinfo.profile",
+                "openid",
+            ]
         )
         flow.redirect_uri = settings.google_redirect_uri
         flow.fetch_token(code=code)
