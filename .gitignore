@@ -1,0 +1,54 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+
+# Virtual environments
+venv/
+.env
+
+# Environment variables
+.env
+*.env
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+*.logs
+
+# Docker
+*.pid
+*.seed
+*.pid.lock
+docker-compose.override.yml
+
+# Python packaging
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# IDEs / editors
+.vscode/
+.idea/
+
+# Output files
+*.zip
+*.tar.gz
+
+# Supabase service keys or cached tokens (if any)
+.supabase/
+
+# Pytest / coverage
+htmlcov/
+.cache/
+.coverage
+coverage.xml
+
+*.ipynb
+supabase/
