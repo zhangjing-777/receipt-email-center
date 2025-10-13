@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from core.database import AsyncSessionLocal
 from core.models import ImportedEmail
-from email_search_sync.gmail_client_service import GmailClient
+from email_search_sync.gmail_client_service import GmailClient  # ✅ 只导入 GmailClient
 
 
 load_dotenv()
@@ -147,17 +147,19 @@ async def mark_as_imported(user_id: str, message_id: str):
 @router.post("")
 async def forward_emails(
     user_id: str,
+    email: str = Query(..., description="要转发的 Gmail 邮箱地址"),
     message_ids: List[str] = Query(..., description="要转发的邮件 ID 列表")
 ):
     """
     批量转发 Gmail 邮件到虚拟邮箱（通过 AWS SMTP）
     
     - **user_id**: Receiptdrop 用户 ID
+    - **email**: 要转发的 Gmail 邮箱地址
     - **message_ids**: Gmail 邮件 ID 列表
     
     返回转发结果统计和详细信息
     """
-    logger.info(f"📨 Forward request: user_id={user_id}, total_emails={len(message_ids)}")
+    logger.info(f"📨 Forward request: user_id={user_id}, email={email}, total_emails={len(message_ids)}")
     
     # 验证配置
     if not all([RECEIPTDROP_INBOX, AWS_SMTP_USER, AWS_SMTP_PASS, SMTP_HOST]):
@@ -165,10 +167,10 @@ async def forward_emails(
         raise HTTPException(status_code=500, detail="SMTP configuration error")
     
     try:
-        gmail = GmailClient(user_id)
+        gmail = GmailClient(user_id, email)  # ✅ 传入 email 参数
         user_email = gmail.user_email or "noreply@receiptdrop.dev"
     except Exception as e:
-        logger.exception(f"❌ Failed to initialize Gmail client for user {user_id}")
+        logger.exception(f"❌ Failed to initialize Gmail client for user {user_id}, email {email}")
         raise HTTPException(status_code=500, detail=f"Gmail client initialization failed: {str(e)}")
     
     # 虚拟邮箱地址
@@ -272,11 +274,12 @@ async def forward_emails(
         "average_duration_seconds": round(total_duration / len(message_ids), 2) if message_ids else 0
     }
     
-    logger.info(f"📊 Forward summary for user {user_id}: {summary}")
+    logger.info(f"📊 Forward summary for user {user_id}, email {email}: {summary}")
     return {
         "summary": summary,
         "details": results,
-        "virtual_inbox": virtual_inbox
+        "virtual_inbox": virtual_inbox,
+        "source_email": email
     }
 
 
