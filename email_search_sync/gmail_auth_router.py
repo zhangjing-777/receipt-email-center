@@ -7,7 +7,7 @@ from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from core.database import AsyncSessionLocal
 from core.models import UserEmailToken
-from core.encryption import encrypt_value
+from core.encryption import encrypt_value, decrypt_value
 from core.config import settings
 
 
@@ -137,7 +137,9 @@ async def gmail_callback(user_id: str, code: str):
 
 @router.get("/check-token")
 async def check_gmail_token(user_id: str):
-    """检查用户是否已授权 Gmail"""
+    """
+    检查用户是否已授权 Gmail，并返回完整的 token 信息（含解密字段）
+    """
     logger.info(f"Checking Gmail token for user_id={user_id}")
     
     try:
@@ -148,24 +150,40 @@ async def check_gmail_token(user_id: str):
                 .where(UserEmailToken.email_provider == 'gmail')
             )
             token = result.scalar_one_or_none()
-        
+
         if not token:
             return {
                 "authorized": False,
                 "message": "No Gmail token found"
             }
-        
+
+        # 构造完整返回字典
+        token_data = {
+            "id": token.id,
+            "user_id": str(token.user_id),
+            "email_provider": token.email_provider,
+            "email": decrypt_value(token.email),
+            "email_hash": token.email_hash,
+            "access_token": decrypt_value(token.access_token),
+            "refresh_token": decrypt_value(token.refresh_token),
+            "token_uri": token.token_uri,
+            "client_id": token.client_id,
+            "client_secret": decrypt_value(token.client_secret),
+            "expiry": token.expiry.isoformat() if token.expiry else None,
+            "created_at": token.created_at.isoformat() if token.created_at else None,
+            "updated_at": token.updated_at.isoformat() if token.updated_at else None,
+        }
+
+        logger.info(f"Gmail token found for user_id={user_id}, email={token_data['email']}")
         return {
             "authorized": True,
-            "email_hash": token.email_hash,
-            "created_at": token.created_at.isoformat() if token.created_at else None,
-            "updated_at": token.updated_at.isoformat() if token.updated_at else None
+            "data": token_data
         }
-        
+
     except Exception as e:
         logger.exception(f"Failed to check Gmail token for user_id={user_id}")
         raise HTTPException(status_code=500, detail=f"Token check failed: {str(e)}")
-
+    
 
 @router.delete("/revoke")
 async def revoke_gmail_token(user_id: str):
