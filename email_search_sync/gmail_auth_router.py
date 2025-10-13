@@ -136,21 +136,20 @@ async def gmail_callback(user_id: str, code: str):
 
 
 @router.get("/check-token")
-async def check_gmail_token(user_id: str, email: str):
+async def check_gmail_token(user_id: str):
     """
     检查用户是否已授权 Gmail，支持多邮箱返回
     返回字段：
       - id, user_id, email_provider, email, access_token, refresh_token, expiry 等全部字段
     """
     logger.info(f"Checking Gmail tokens for user_id={user_id}")
-    email_hash = generate_email_hash(email)
+
     try:
         async with AsyncSessionLocal() as session:
             result = await session.execute(
                 select(UserEmailToken)
                 .where(UserEmailToken.user_id == user_id)
                 .where(UserEmailToken.email_provider == 'gmail')
-                .where(UserEmailToken.email_hash == email_hash)
             )
             tokens = result.scalars().all()  # ✅ 返回多条
 

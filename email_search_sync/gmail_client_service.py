@@ -1,4 +1,5 @@
 import logging
+import hashlib
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from googleapiclient.discovery import build
@@ -12,11 +13,24 @@ from core.encryption import encrypt_value, decrypt_value
 logger = logging.getLogger(__name__)
 
 
+def generate_email_hash(email: str) -> str:
+    """生成邮箱的 SHA256 哈希值"""
+    return hashlib.sha256(email.lower().encode('utf-8')).hexdigest()
+
+
 class GmailClient:
     """Gmail API 客户端（使用 SQLAlchemy 管理 token）"""
     
-    def __init__(self, user_id: str):
+    def __init__(self, user_id: str, email: str = None):
+        """
+        初始化 Gmail 客户端
+        
+        Args:
+            user_id: 用户ID
+            email: Gmail 邮箱地址（可选）。如果不指定且用户有多个邮箱，会抛出异常
+        """
         self.user_id = user_id
+        self.email = email
         self.service = None
         self.user_email = None
         self._initialize_service()
@@ -39,7 +53,10 @@ class GmailClient:
             token_data = loop.run_until_complete(self._get_token_data())
         
         if not token_data:
-            raise Exception(f"No Gmail token found for user {self.user_id}")
+            error_msg = f"No Gmail token found for user {self.user_id}"
+            if self.email:
+                error_msg += f" with email {self.email}"
+            raise Exception(error_msg)
         
         # 解密 token 数据
         creds = Credentials(
@@ -61,30 +78,49 @@ class GmailClient:
             except RuntimeError:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
-                loop.run_until_complete(self._update_access_token(creds.token))
+                loop.run_until_complete(self._update_access_token(creds.token, token_data["email_hash"]))
                 loop.close()
             else:
-                loop.run_until_complete(self._update_access_token(creds.token))
+                loop.run_until_complete(self._update_access_token(creds.token, token_data["email_hash"]))
         
         self.service = build("gmail", "v1", credentials=creds)
         self.user_email = decrypt_value(token_data["email"])
-        logger.info(f"Gmail service initialized for user {self.user_id}")
+        logger.info(f"Gmail service initialized for user {self.user_id}, email {self.user_email}")
     
     async def _get_token_data(self):
         """从数据库获取 token 数据"""
         async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(UserEmailToken)
-                .where(UserEmailToken.user_id == self.user_id)
-                .where(UserEmailToken.email_provider == 'gmail')
+            query = select(UserEmailToken).where(
+                UserEmailToken.user_id == self.user_id,
+                UserEmailToken.email_provider == 'gmail'
             )
-            token = result.scalar_one_or_none()
             
-            if not token:
+            # 如果指定了邮箱，添加邮箱过滤
+            if self.email:
+                email_hash = generate_email_hash(self.email)
+                query = query.where(UserEmailToken.email_hash == email_hash)
+            
+            result = await session.execute(query)
+            tokens = result.scalars().all()
+            
+            if not tokens:
                 return None
+            
+            if len(tokens) > 1 and not self.email:
+                # 如果有多个邮箱但没有指定，抛出错误
+                decrypted_emails = [decrypt_value(t.email) for t in tokens]
+                error_msg = (
+                    f"User {self.user_id} has {len(tokens)} Gmail accounts linked. "
+                    f"Please specify which email to use: {', '.join(decrypted_emails)}"
+                )
+                logger.error(error_msg)
+                raise Exception(error_msg)
+            
+            token = tokens[0]
             
             return {
                 "email": token.email,
+                "email_hash": token.email_hash,
                 "access_token": token.access_token,
                 "refresh_token": token.refresh_token,
                 "token_uri": token.token_uri,
@@ -92,7 +128,7 @@ class GmailClient:
                 "client_secret": token.client_secret
             }
     
-    async def _update_access_token(self, new_token: str):
+    async def _update_access_token(self, new_token: str, email_hash: str):
         """更新数据库中的 access_token"""
         encrypted_token = encrypt_value(new_token)
         
@@ -102,15 +138,14 @@ class GmailClient:
                 .values(
                     user_id=self.user_id,
                     email_provider='gmail',
+                    email_hash=email_hash,
                     access_token=encrypted_token
                 )
                 .on_conflict_do_update(
-                    index_elements=['user_id', 'email_provider'],
+                    index_elements=['user_id', 'email_provider', 'email_hash'],
                     set_={'access_token': encrypted_token}
                 )
             )
             await session.commit()
         
-        logger.info(f"Access token updated for user {self.user_id}")
-
-
+        logger.info(f"Access token updated for user {self.user_id}, email_hash {email_hash[:8]}...")

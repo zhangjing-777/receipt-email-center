@@ -50,6 +50,7 @@ def build_gmail_query(
 @router.get("")
 async def search_gmail(
     user_id: str,
+    email: str = Query(..., description="要搜索的 Gmail 邮箱地址"),
     keywords: str = Query(default="invoice OR receipt OR 发票", description="搜索关键词"),
     limit: int = Query(default=10, ge=1, le=100, description="返回结果数量（1-100）"),
     page_token: Optional[str] = Query(default=None, description="分页 token"),
@@ -63,6 +64,7 @@ async def search_gmail(
     搜索 Gmail 邮件（支持分页和日期过滤）
     
     - **user_id**: Receiptdrop 用户 ID
+    - **email**: 要搜索的 Gmail 邮箱地址
     - **keywords**: 搜索关键词（默认：invoice OR receipt OR 发票）
     - **limit**: 返回结果数量（1-100，默认 10）
     - **page_token**: 分页 token（从上一次响应中获取）
@@ -72,10 +74,10 @@ async def search_gmail(
     - **has_attachment**: 是否必须有附件
     - **from_address**: 发件人邮箱地址
     """
-    logger.info(f"Gmail search requested: user_id={user_id}, keywords={keywords}, limit={limit}")
+    logger.info(f"Gmail search requested: user_id={user_id}, email={email}, keywords={keywords}, limit={limit}")
     
     try:
-        gmail = GmailClient(user_id)
+        gmail = GmailClient(user_id, email)
         
         # 如果指定了 days_back，自动计算 after_date
         if days_back and not after_date:
@@ -149,34 +151,36 @@ async def search_gmail(
         response = {
             "total_found": len(messages),
             "messages": messages,
-            "query": query
+            "query": query,
+            "searched_email": email
         }
         
         # 如果有下一页，添加 next_page_token
         if "nextPageToken" in results:
             response["next_page_token"] = results["nextPageToken"]
         
-        logger.info(f"Gmail search completed: found {len(messages)} messages for user {user_id}")
+        logger.info(f"Gmail search completed: found {len(messages)} messages for user {user_id}, email {email}")
         return response
         
     except Exception as e:
-        logger.exception(f"Gmail search failed for user_id={user_id}")
+        logger.exception(f"Gmail search failed for user_id={user_id}, email={email}")
         raise HTTPException(status_code=500, detail=f"Gmail search failed: {str(e)}")
 
 
 @router.get("/count")
 async def count_gmail_messages(
     user_id: str,
+    email: str = Query(..., description="要统计的 Gmail 邮箱地址"),
     keywords: str = Query(default="invoice OR receipt OR 发票", description="搜索关键词"),
     days_back: Optional[int] = Query(default=None, ge=1, le=365, description="统计最近 N 天的邮件")
 ):
     """
     统计符合条件的邮件数量（不返回具体邮件内容）
     """
-    logger.info(f"Gmail count requested: user_id={user_id}, keywords={keywords}")
+    logger.info(f"Gmail count requested: user_id={user_id}, email={email}, keywords={keywords}")
     
     try:
-        gmail = GmailClient(user_id)
+        gmail = GmailClient(user_id, email)
         
         # 如果指定了 days_back，自动计算 after_date
         after_date = None
@@ -195,14 +199,14 @@ async def count_gmail_messages(
         
         total_count = results.get("resultSizeEstimate", 0)
         
-        logger.info(f"Gmail count completed: found ~{total_count} messages for user {user_id}")
+        logger.info(f"Gmail count completed: found ~{total_count} messages for user {user_id}, email {email}")
         return {
             "count": total_count,
             "query": query,
+            "email": email,
             "note": "This is an estimate from Gmail API"
         }
         
     except Exception as e:
-        logger.exception(f"Gmail count failed for user_id={user_id}")
+        logger.exception(f"Gmail count failed for user_id={user_id}, email={email}")
         raise HTTPException(status_code=500, detail=f"Gmail count failed: {str(e)}")
-
