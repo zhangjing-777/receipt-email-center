@@ -1,5 +1,6 @@
 import logging
 import hashlib
+import asyncio
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from googleapiclient.discovery import build
@@ -33,24 +34,31 @@ class GmailClient:
         self.email = email
         self.service = None
         self.user_email = None
-        self._initialize_service()
+        # ✅ 不在 __init__ 中初始化，而是延迟到第一次使用
+        self._initialized = False
     
-    def _initialize_service(self):
-        """初始化 Gmail 服务（同步方法，在构造函数中调用）"""
-        import asyncio
+    def _ensure_initialized(self):
+        """确保服务已初始化（同步方法）"""
+        if self._initialized:
+            return
         
-        # 如果已经在事件循环中，直接运行
+        # ✅ 使用 asyncio.run() 来处理异步初始化
         try:
+            # 检查是否已经有运行中的事件循环
             loop = asyncio.get_running_loop()
+            # 如果有运行中的循环，使用 nest_asyncio 或直接抛出错误
+            raise RuntimeError(
+                "Cannot initialize GmailClient synchronously in an async context. "
+                "Please use 'await GmailClient.create(user_id, email)' instead."
+            )
         except RuntimeError:
-            # 没有运行的事件循环，创建一个新的
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            token_data = loop.run_until_complete(self._get_token_data())
-            loop.close()
-        else:
-            # 已经在事件循环中，使用 run_until_complete
-            token_data = loop.run_until_complete(self._get_token_data())
+            # 没有运行中的事件循环，可以使用 asyncio.run()
+            asyncio.run(self._async_initialize())
+            self._initialized = True
+    
+    async def _async_initialize(self):
+        """异步初始化 Gmail 服务"""
+        token_data = await self._get_token_data()
         
         if not token_data:
             error_msg = f"No Gmail token found for user {self.user_id}"
@@ -73,19 +81,24 @@ class GmailClient:
             creds.refresh(Request())
             
             # 更新数据库中的 access_token
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                loop.run_until_complete(self._update_access_token(creds.token, token_data["email_hash"]))
-                loop.close()
-            else:
-                loop.run_until_complete(self._update_access_token(creds.token, token_data["email_hash"]))
+            await self._update_access_token(creds.token, token_data["email_hash"])
         
         self.service = build("gmail", "v1", credentials=creds)
         self.user_email = decrypt_value(token_data["email"])
         logger.info(f"Gmail service initialized for user {self.user_id}, email {self.user_email}")
+    
+    @classmethod
+    async def create(cls, user_id: str, email: str = None):
+        """
+        ✅ 异步工厂方法，用于在异步上下文中创建 GmailClient
+        
+        使用方式：
+            gmail = await GmailClient.create(user_id, email)
+        """
+        instance = cls(user_id, email)
+        await instance._async_initialize()
+        instance._initialized = True
+        return instance
     
     async def _get_token_data(self):
         """从数据库获取 token 数据"""

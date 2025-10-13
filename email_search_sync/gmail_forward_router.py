@@ -167,7 +167,7 @@ async def forward_emails(
         raise HTTPException(status_code=500, detail="SMTP configuration error")
     
     try:
-        gmail = GmailClient(user_id, email)  # ✅ 传入 email 参数
+        gmail = await GmailClient.create(user_id, email)  # ✅ 使用异步创建
         user_email = gmail.user_email or "noreply@receiptdrop.dev"
     except Exception as e:
         logger.exception(f"❌ Failed to initialize Gmail client for user {user_id}, email {email}")

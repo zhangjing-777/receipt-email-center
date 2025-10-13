@@ -77,7 +77,7 @@ async def search_gmail(
     logger.info(f"Gmail search requested: user_id={user_id}, email={email}, keywords={keywords}, limit={limit}")
     
     try:
-        gmail = GmailClient(user_id, email)
+        gmail = await GmailClient.create(user_id, email)  # ✅ 使用异步创建
         
         # 如果指定了 days_back，自动计算 after_date
         if days_back and not after_date:
