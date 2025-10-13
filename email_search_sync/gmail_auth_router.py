@@ -138,9 +138,11 @@ async def gmail_callback(user_id: str, code: str):
 @router.get("/check-token")
 async def check_gmail_token(user_id: str):
     """
-    检查用户是否已授权 Gmail，并返回完整的 token 信息（含解密字段）
+    检查用户是否已授权 Gmail，支持多邮箱返回
+    返回字段：
+      - id, user_id, email_provider, email, access_token, refresh_token, expiry 等全部字段
     """
-    logger.info(f"Checking Gmail token for user_id={user_id}")
+    logger.info(f"Checking Gmail tokens for user_id={user_id}")
     
     try:
         async with AsyncSessionLocal() as session:
@@ -149,41 +151,49 @@ async def check_gmail_token(user_id: str):
                 .where(UserEmailToken.user_id == user_id)
                 .where(UserEmailToken.email_provider == 'gmail')
             )
-            token = result.scalar_one_or_none()
+            tokens = result.scalars().all()  # ✅ 返回多条
 
-        if not token:
+        if not tokens:
             return {
                 "authorized": False,
-                "message": "No Gmail token found"
+                "message": "No Gmail tokens found"
             }
 
-        # 构造完整返回字典
-        token_data = {
-            "id": token.id,
-            "user_id": str(token.user_id),
-            "email_provider": token.email_provider,
-            "email": decrypt_value(token.email),
-            "email_hash": token.email_hash,
-            "access_token": decrypt_value(token.access_token),
-            "refresh_token": decrypt_value(token.refresh_token),
-            "token_uri": token.token_uri,
-            "client_id": token.client_id,
-            "client_secret": decrypt_value(token.client_secret),
-            "expiry": token.expiry.isoformat() if token.expiry else None,
-            "created_at": token.created_at.isoformat() if token.created_at else None,
-            "updated_at": token.updated_at.isoformat() if token.updated_at else None,
-        }
+        # ✅ 逐条解密并转换
+        token_list = []
+        for token in tokens:
+            try:
+                token_data = {
+                    "id": token.id,
+                    "user_id": str(token.user_id),
+                    "email_provider": token.email_provider,
+                    "email": decrypt_value(token.email),
+                    "email_hash": token.email_hash,
+                    "access_token": decrypt_value(token.access_token),
+                    "refresh_token": decrypt_value(token.refresh_token),
+                    "token_uri": token.token_uri,
+                    "client_id": token.client_id,
+                    "client_secret": decrypt_value(token.client_secret),
+                    "expiry": token.expiry.isoformat() if token.expiry else None,
+                    "created_at": token.created_at.isoformat() if token.created_at else None,
+                    "updated_at": token.updated_at.isoformat() if token.updated_at else None,
+                }
+                token_list.append(token_data)
+            except Exception as inner_e:
+                logger.warning(f"Failed to decrypt token id={token.id}: {inner_e}")
 
-        logger.info(f"Gmail token found for user_id={user_id}, email={token_data['email']}")
+        logger.info(f"Found {len(token_list)} Gmail tokens for user_id={user_id}")
+
         return {
             "authorized": True,
-            "data": token_data
+            "count": len(token_list),
+            "data": token_list
         }
 
     except Exception as e:
         logger.exception(f"Failed to check Gmail token for user_id={user_id}")
         raise HTTPException(status_code=500, detail=f"Token check failed: {str(e)}")
-    
+  
 
 @router.delete("/revoke")
 async def revoke_gmail_token(user_id: str):
