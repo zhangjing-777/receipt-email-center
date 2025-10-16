@@ -247,8 +247,8 @@ async def process_single_email(
 @router.post("")
 async def forward_emails(
     user_id: str,
-    email: str = Query(..., description="要转发的 Gmail 邮箱地址"),
-    message_ids: List[str] = Query(..., description="要转发的邮件 ID 列表"),
+    email: str,
+    message_ids: str = Query(..., description="要转发的邮件 ID，多个用逗号分隔"),
     concurrent_limit: int = Query(default=5, ge=1, le=10, description="并发处理数量（1-10）")
 ):
     """
@@ -256,12 +256,15 @@ async def forward_emails(
     
     - **user_id**: Receiptdrop 用户 ID
     - **email**: 要转发的 Gmail 邮箱地址
-    - **message_ids**: Gmail 邮件 ID 列表
+    - **message_ids**: Gmail 邮件 ID，多个用逗号分隔 (例如: "id1,id2,id3")
     - **concurrent_limit**: 并发处理数量（默认5，最大10）
     
     返回转发结果统计和详细信息
     """
-    logger.info(f"📨 Forward request: user_id={user_id}, email={email}, total_emails={len(message_ids)}, concurrent={concurrent_limit}")
+    # 将逗号分隔的字符串转换为列表
+    message_id_list = [mid.strip() for mid in message_ids.split(',') if mid.strip()]
+    
+    logger.info(f"📨 Forward request: user_id={user_id}, email={email}, total_emails={len(message_id_list)}, concurrent={concurrent_limit}")
     
     # 验证配置
     if not all([RECEIPTDROP_INBOX, AWS_SMTP_USER, AWS_SMTP_PASS, SMTP_HOST]):
