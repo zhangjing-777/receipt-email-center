@@ -3,6 +3,7 @@ import logging
 import base64
 import smtplib
 import time
+import asyncio
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
@@ -13,7 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from core.database import AsyncSessionLocal
 from core.models import ImportedEmail
-from email_search_sync.gmail_client_service import GmailClient  # ✅ 只导入 GmailClient
+from email_search_sync.gmail_client_service import GmailClient
 
 
 load_dotenv()
@@ -40,7 +41,7 @@ class EmailForwardError(Exception):
     pass
 
 
-def send_email_via_smtp(
+async def send_email_via_smtp_async(
     from_email: str,
     to_email: str,
     raw_eml_data: bytes,
@@ -48,7 +49,7 @@ def send_email_via_smtp(
     retry_count: int = 0
 ) -> bool:
     """
-    通过 AWS SMTP 转发原始邮件（带重试机制）
+    异步方式通过 AWS SMTP 转发原始邮件（带重试机制）
     
     Args:
         from_email: 发件人邮箱
@@ -63,53 +64,62 @@ def send_email_via_smtp(
     Raises:
         EmailForwardError: 发送失败且超过最大重试次数
     """
-    try:
-        # 创建 SMTP 连接
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
-            server.starttls()  # 启用 TLS
-            server.login(AWS_SMTP_USER, AWS_SMTP_PASS)
-            
-            # 创建邮件容器
-            msg = MIMEMultipart()
-            msg['From'] = from_email
-            msg['To'] = to_email
-            msg['Subject'] = f"Forwarded Email from Gmail (ID: {message_id[:8]}...)"
-            msg['X-Gmail-Message-ID'] = message_id  # 用于追踪
-            msg['X-Forwarded-By'] = 'ReceiptDrop'
-            
-            # 将原始邮件作为附件添加
-            part = MIMEBase('message', 'rfc822')
-            part.set_payload(raw_eml_data)
-            encoders.encode_base64(part)
-            part.add_header(
-                'Content-Disposition',
-                f'attachment; filename="forwarded_{message_id[:8]}.eml"'
-            )
-            msg.attach(part)
-            
-            # 发送邮件
-            server.send_message(msg)
-            logger.info(f"✅ Email sent via SMTP: message_id={message_id}, to={to_email}")
-            return True
-            
-    except smtplib.SMTPAuthenticationError as e:
-        logger.error(f"❌ SMTP authentication failed: {str(e)}")
-        raise EmailForwardError(f"SMTP authentication failed: {str(e)}")
-    
-    except smtplib.SMTPException as e:
-        logger.warning(f"⚠️ SMTP error for message {message_id} (attempt {retry_count + 1}): {str(e)}")
+    def _send_sync():
+        """同步发送函数，将在线程池中执行"""
+        try:
+            # 创建 SMTP 连接
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+                server.starttls()
+                server.login(AWS_SMTP_USER, AWS_SMTP_PASS)
+                
+                # 创建邮件容器
+                msg = MIMEMultipart()
+                msg['From'] = from_email
+                msg['To'] = to_email
+                msg['Subject'] = f"Forwarded Email from Gmail (ID: {message_id[:8]}...)"
+                msg['X-Gmail-Message-ID'] = message_id
+                msg['X-Forwarded-By'] = 'ReceiptDrop'
+                
+                # 将原始邮件作为附件添加
+                part = MIMEBase('message', 'rfc822')
+                part.set_payload(raw_eml_data)
+                encoders.encode_base64(part)
+                part.add_header(
+                    'Content-Disposition',
+                    f'attachment; filename="forwarded_{message_id[:8]}.eml"'
+                )
+                msg.attach(part)
+                
+                # 发送邮件
+                server.send_message(msg)
+                logger.info(f"✅ Email sent via SMTP: message_id={message_id}, to={to_email}")
+                return True
+                
+        except smtplib.SMTPAuthenticationError as e:
+            logger.error(f"❌ SMTP authentication failed: {str(e)}")
+            raise EmailForwardError(f"SMTP authentication failed: {str(e)}")
         
+        except smtplib.SMTPException as e:
+            logger.warning(f"⚠️ SMTP error for message {message_id} (attempt {retry_count + 1}): {str(e)}")
+            raise EmailForwardError(f"SMTP error: {str(e)}")
+        
+        except Exception as e:
+            logger.error(f"❌ Unexpected error sending email {message_id}: {str(e)}")
+            raise EmailForwardError(f"Unexpected error: {str(e)}")
+    
+    try:
+        # 在线程池中执行同步SMTP操作，避免阻塞事件循环
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _send_sync)
+        return True
+    except EmailForwardError as e:
         # 如果未超过最大重试次数，进行重试
         if retry_count < MAX_RETRY_ATTEMPTS:
-            time.sleep(RETRY_DELAY_SECONDS * (retry_count + 1))  # 指数退避
+            await asyncio.sleep(RETRY_DELAY_SECONDS * (retry_count + 1))
             logger.info(f"🔄 Retrying email {message_id}, attempt {retry_count + 2}/{MAX_RETRY_ATTEMPTS + 1}")
-            return send_email_via_smtp(from_email, to_email, raw_eml_data, message_id, retry_count + 1)
+            return await send_email_via_smtp_async(from_email, to_email, raw_eml_data, message_id, retry_count + 1)
         else:
-            raise EmailForwardError(f"SMTP error after {MAX_RETRY_ATTEMPTS} retries: {str(e)}")
-    
-    except Exception as e:
-        logger.error(f"❌ Unexpected error sending email {message_id}: {str(e)}")
-        raise EmailForwardError(f"Unexpected error: {str(e)}")
+            raise
 
 
 async def check_already_imported(user_id: str, message_ids: List[str]) -> dict:
@@ -130,25 +140,116 @@ async def check_already_imported(user_id: str, message_ids: List[str]) -> dict:
     return {mid: (mid in imported_ids) for mid in message_ids}
 
 
-async def mark_as_imported(user_id: str, message_id: str):
-    """标记邮件为已导入"""
+async def mark_as_imported_batch(user_id: str, message_ids: List[str]):
+    """批量标记邮件为已导入（优化：减少数据库往返）"""
+    if not message_ids:
+        return
+    
     async with AsyncSessionLocal() as session:
-        stmt = pg_insert(ImportedEmail).values({
-            "user_id": user_id,
-            "message_id": message_id,
-            "attachment_id": "WHOLE_MESSAGE"
-        }).on_conflict_do_nothing(
+        values = [
+            {
+                "user_id": user_id,
+                "message_id": mid,
+                "attachment_id": "WHOLE_MESSAGE"
+            }
+            for mid in message_ids
+        ]
+        
+        stmt = pg_insert(ImportedEmail).values(values).on_conflict_do_nothing(
             index_elements=['user_id', 'message_id']
         )
         await session.execute(stmt)
         await session.commit()
 
 
+async def process_single_email(
+    gmail,
+    user_id: str,
+    user_email: str,
+    virtual_inbox: str,
+    message_id: str,
+    is_imported: bool
+) -> dict:
+    """处理单个邮件的转发（异步）"""
+    try:
+        # 去重检查
+        if is_imported:
+            logger.info(f"⏭️ Message {message_id} already imported, skipping")
+            return {
+                "message_id": message_id,
+                "status": "skipped",
+                "reason": "already_imported"
+            }
+
+        # 获取原始邮件（RFC822 格式）
+        msg = gmail.service.users().messages().get(
+            userId="me",
+            id=message_id,
+            format="raw"
+        ).execute()
+        
+        raw_eml_base64url = msg.get("raw")
+        
+        if not raw_eml_base64url:
+            logger.error(f"❌ No raw content for message {message_id}")
+            return {
+                "message_id": message_id,
+                "status": "failed",
+                "reason": "no_raw_content"
+            }
+        
+        # Base64url 解码
+        raw_eml_base64 = raw_eml_base64url.replace('-', '+').replace('_', '/')
+        padding = len(raw_eml_base64) % 4
+        if padding:
+            raw_eml_base64 += '=' * (4 - padding)
+        
+        raw_eml_bytes = base64.b64decode(raw_eml_base64)
+        
+        # 记录邮件大小
+        email_size_kb = len(raw_eml_bytes) / 1024
+        logger.info(f"📦 Email size: {email_size_kb:.2f} KB")
+
+        # 通过 AWS SMTP 转发邮件（异步）
+        forward_start = time.time()
+        await send_email_via_smtp_async(
+            from_email=user_email,
+            to_email=virtual_inbox,
+            raw_eml_data=raw_eml_bytes,
+            message_id=message_id
+        )
+        forward_duration = time.time() - forward_start
+
+        logger.info(f"✅ Forwarded message {message_id} in {forward_duration:.2f}s")
+        return {
+            "message_id": message_id,
+            "status": "forwarded",
+            "size_kb": round(email_size_kb, 2),
+            "duration_seconds": round(forward_duration, 2)
+        }
+        
+    except EmailForwardError as e:
+        logger.error(f"❌ Forward failed for {message_id}: {str(e)}")
+        return {
+            "message_id": message_id,
+            "status": "failed",
+            "reason": str(e)
+        }
+    except Exception as e:
+        logger.exception(f"❌ Unexpected error for {message_id}")
+        return {
+            "message_id": message_id,
+            "status": "failed",
+            "reason": f"unexpected_error: {str(e)}"
+        }
+
+
 @router.post("")
 async def forward_emails(
     user_id: str,
     email: str = Query(..., description="要转发的 Gmail 邮箱地址"),
-    message_ids: List[str] = Query(..., description="要转发的邮件 ID 列表")
+    message_ids: List[str] = Query(..., description="要转发的邮件 ID 列表"),
+    concurrent_limit: int = Query(default=5, ge=1, le=10, description="并发处理数量（1-10）")
 ):
     """
     批量转发 Gmail 邮件到虚拟邮箱（通过 AWS SMTP）
@@ -156,10 +257,11 @@ async def forward_emails(
     - **user_id**: Receiptdrop 用户 ID
     - **email**: 要转发的 Gmail 邮箱地址
     - **message_ids**: Gmail 邮件 ID 列表
+    - **concurrent_limit**: 并发处理数量（默认5，最大10）
     
     返回转发结果统计和详细信息
     """
-    logger.info(f"📨 Forward request: user_id={user_id}, email={email}, total_emails={len(message_ids)}")
+    logger.info(f"📨 Forward request: user_id={user_id}, email={email}, total_emails={len(message_ids)}, concurrent={concurrent_limit}")
     
     # 验证配置
     if not all([RECEIPTDROP_INBOX, AWS_SMTP_USER, AWS_SMTP_PASS, SMTP_HOST]):
@@ -167,7 +269,7 @@ async def forward_emails(
         raise HTTPException(status_code=500, detail="SMTP configuration error")
     
     try:
-        gmail = await GmailClient.create(user_id, email)  # ✅ 使用异步创建
+        gmail = await GmailClient.create(user_id, email)
         user_email = gmail.user_email or "noreply@receiptdrop.dev"
     except Exception as e:
         logger.exception(f"❌ Failed to initialize Gmail client for user {user_id}, email {email}")
@@ -179,89 +281,28 @@ async def forward_emails(
     # 批量检查已导入的邮件
     imported_status = await check_already_imported(user_id, message_ids)
     
-    results = []
+    # 并发处理邮件
     start_time = time.time()
-
-    for idx, mid in enumerate(message_ids, 1):
-        logger.info(f"📧 Processing {idx}/{len(message_ids)}: message_id={mid}")
-        
-        try:
-            # 去重检查
-            if imported_status.get(mid, False):
-                logger.info(f"⏭️ Message {mid} already imported, skipping")
-                results.append({
-                    "message_id": mid,
-                    "status": "skipped",
-                    "reason": "already_imported"
-                })
-                continue
-
-            # 获取原始邮件（RFC822 格式）
-            msg = gmail.service.users().messages().get(
-                userId="me",
-                id=mid,
-                format="raw"
-            ).execute()
-            
-            raw_eml_base64url = msg.get("raw")
-            
-            if not raw_eml_base64url:
-                logger.error(f"❌ No raw content for message {mid}")
-                results.append({
-                    "message_id": mid,
-                    "status": "failed",
-                    "reason": "no_raw_content"
-                })
-                continue
-            
-            # Base64url 解码（Gmail API 使用 base64url 编码）
-            raw_eml_base64 = raw_eml_base64url.replace('-', '+').replace('_', '/')
-            # 添加填充
-            padding = len(raw_eml_base64) % 4
-            if padding:
-                raw_eml_base64 += '=' * (4 - padding)
-            
-            raw_eml_bytes = base64.b64decode(raw_eml_base64)
-            
-            # 记录邮件大小
-            email_size_kb = len(raw_eml_bytes) / 1024
-            logger.info(f"📦 Email size: {email_size_kb:.2f} KB")
-
-            # 通过 AWS SMTP 转发邮件
-            forward_start = time.time()
-            send_email_via_smtp(
-                from_email=user_email,
-                to_email=virtual_inbox,
-                raw_eml_data=raw_eml_bytes,
-                message_id=mid
+    results = []
+    
+    # 使用 Semaphore 控制并发数量
+    semaphore = asyncio.Semaphore(concurrent_limit)
+    
+    async def process_with_semaphore(mid):
+        async with semaphore:
+            return await process_single_email(
+                gmail, user_id, user_email, virtual_inbox, mid, imported_status.get(mid, False)
             )
-            forward_duration = time.time() - forward_start
-
-            # 标记为已导入
-            await mark_as_imported(user_id, mid)
-
-            logger.info(f"✅ Forwarded message {mid} in {forward_duration:.2f}s")
-            results.append({
-                "message_id": mid,
-                "status": "forwarded",
-                "size_kb": round(email_size_kb, 2),
-                "duration_seconds": round(forward_duration, 2)
-            })
-            
-        except EmailForwardError as e:
-            logger.error(f"❌ Forward failed for {mid}: {str(e)}")
-            results.append({
-                "message_id": mid,
-                "status": "failed",
-                "reason": str(e)
-            })
-        except Exception as e:
-            logger.exception(f"❌ Unexpected error for {mid}")
-            results.append({
-                "message_id": mid,
-                "status": "failed",
-                "reason": f"unexpected_error: {str(e)}"
-            })
+    
+    # 并发执行所有邮件处理
+    tasks = [process_with_semaphore(mid) for mid in message_ids]
+    results = await asyncio.gather(*tasks)
+    
+    # 批量标记已成功转发的邮件
+    forwarded_ids = [r["message_id"] for r in results if r["status"] == "forwarded"]
+    if forwarded_ids:
+        await mark_as_imported_batch(user_id, forwarded_ids)
+        logger.info(f"✅ Marked {len(forwarded_ids)} emails as imported")
 
     # 统计结果
     total_duration = time.time() - start_time
@@ -288,18 +329,22 @@ async def test_smtp_connection():
     """测试 AWS SMTP 连接"""
     logger.info("🔍 Testing SMTP connection...")
     
-    try:
+    def _test_sync():
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
             server.starttls()
             server.login(AWS_SMTP_USER, AWS_SMTP_PASS)
-            logger.info("✅ SMTP connection test successful")
-            return {
-                "status": "success",
-                "message": "SMTP connection is working",
-                "smtp_host": SMTP_HOST,
-                "smtp_port": SMTP_PORT,
-                "smtp_user": AWS_SMTP_USER[:4] + "***"  # 隐藏敏感信息
-            }
+    
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _test_sync)
+        logger.info("✅ SMTP connection test successful")
+        return {
+            "status": "success",
+            "message": "SMTP connection is working",
+            "smtp_host": SMTP_HOST,
+            "smtp_port": SMTP_PORT,
+            "smtp_user": AWS_SMTP_USER[:4] + "***"
+        }
     except Exception as e:
         logger.exception("❌ SMTP connection test failed")
         raise HTTPException(status_code=500, detail=f"SMTP test failed: {str(e)}")
